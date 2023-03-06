@@ -4,6 +4,7 @@ Import
 """
 import os, time
 import numpy as np
+from collections import OrderedDict
 
 """
 tvb root imports
@@ -154,10 +155,11 @@ simulator.print_summary_info_details(recursive=1)
 netParams = specs.NetParams()
 
 # NetPyNE specification for E and I synaptic mechanisms:
-receptor_type_E = 'exc'
-receptor_type_I = 'inh'
-netParams.synMechParams[receptor_type_E] = {'mod': 'Exp2Syn', 'tau1': 0.15, 'tau2': 1.5, 'e': 0}  # NMDA
-netParams.synMechParams[receptor_type_I] = {'mod': 'Exp2Syn', 'tau1': 0.07, 'tau2': 9.1, 'e': -80}  # GABA
+# see 'receptor_type' in populations_connections
+exc_syn = 'exc'
+inh_syn = 'inh'
+netParams.synMechParams[exc_syn] = {'mod': 'Exp2Syn', 'tau1': 0.15, 'tau2': 1.5, 'e': 0}  # NMDA
+netParams.synMechParams[inh_syn] = {'mod': 'Exp2Syn', 'tau1': 0.07, 'tau2': 9.1, 'e': -80}  # GABA
 
 # Basic description of Hogkin-Huxley single-compartment cell in NetPyNE:
 cellModelLabel = 'PYR'
@@ -176,7 +178,7 @@ cfg.recordStep = 0.1
 # Load NetPyNE
 netpyne = load_netpyne(config = config)
 
-netpyne_model_builder = NetpyneNetworkBuilder(simulator, spiking_nodes_inds=NETPYNE_NODES_INDS, netpyne_instance=netpyne, config=config)
+netpyne_model_builder = NetpyneNetworkBuilder(simulator, spiking_nodes_inds=NODES_INDS, netpyne_instance=netpyne, config=config)
 netpyne_model_builder.population_order = N_NEURONS
 netpyne_model_builder.tvb_to_spiking_dt_ratio = 2
 netpyne_model_builder.monitor_period = 1.0
@@ -189,7 +191,7 @@ netpyne_model_builder.populations = [
         "label": "E", # Population label, inherent to TVB mean-field model
         "model": cellModelLabel, # NetPyNE cell model
         "nodes": None,  # None means "all" -> building this population to all spiking_nodes_inds
-        "params": {}, # custom parameters can go here
+        #"params": {}, # custom parameters ?
         "scale": scale_e # multiply netpyne_model_builder.population_order for the exact populations' size
     },
     {
@@ -200,3 +202,170 @@ netpyne_model_builder.populations = [
     }
 ]
 
+netpyne_model_builder.populations_connections = [
+    {#E->E
+        "source": "E", "target": "E",
+        "conn_spec": {"rule": {"prob": 0.01}},
+        "weight": 0.01,
+        "delay": 1,
+        "receptor_type": exc_syn,
+        "nodes": None, # None <- "all": all spiking_nodes_inds
+    },
+    {#E->I
+        "source": "E", "target": "I",
+        "conn_spec": {"rule": {"prob": 0.01}},
+        "weight": 0.01,
+        "delay": 1,
+        "receptor_type": exc_syn,
+        "nodes": None,
+    },
+    {#I->E
+        "source": "I", "target": "E",
+        "conn_spec": {"rule": {"prob": 0.01}},
+        "weight": 0.01,
+        "delay": 1,
+        "receptor_type": inh_syn,
+        "nodes": None,
+    },
+    {#I->I
+        "source": "I", "target": "I",
+        "conn_spec": {"rule": {"prob": 0.01}},
+        "weight": 0.01,
+        "delay": 1,
+        "receptor_type": inh_syn,
+        "nodes": None,
+    }
+]
+
+"""
+connectivity weights source->target * global coupling scaling      * netpyne synaptic weight w/ tvb coupling mode
+from DEFAULT_CONNECTIVITY_ZIP       * 0.00390625 (netpyne default) * 1e-2 (scaling with TVB)
+"""
+def tvb_weight_fun(source_node, target_node):
+    return simulator.connectivity.weights[target_node, source_node] * 0.00390625 * 1e-2
+def tvb_delay_fun(source_node, target_node):
+    return simulator.connectivity.delays[target_node, source_node]
+
+def synaptic_weight_scale_func(is_coupling_mode_tvb):
+    return 1e-2
+
+netpyne_model_builder.nodes_connections = [
+    {
+        'source': 'E', 'target': 'I',
+        'conn_spec': {'rule': {'prob': 0.01}},
+        'weight': tvb_weight_fun,
+        'delay': tvb_delay_fun,
+        'receptor_type': exc_syn,
+        'source_nodes': None,
+        'target_nodes': None
+    }
+]
+
+connections = OrderedDict( (l,l) for l in ["E", "I"] )
+spike_recorder = {
+    "model": "spike_recorder",
+    "params": config.NETPYNE_OUTPUT_DEVICES_PARAMS_DEF["spike_recorder"].copy(),
+    "connections": connections,
+    "nodes": None
+}
+
+netpyne_model_builder.output_devices = [spike_recorder]
+
+duration = 350
+simulator.simulation_length = duration
+config.simulation_length = duration
+
+netpyne_model_builder.configure(netParams, cfg, autoCreateSpikingNodes=True)
+
+netpyne_network = netpyne_model_builder.build()
+
+netpyne_network.configure()
+netpyne_network.print_summary_info_details(recursive=3, connectivity=True)
+
+########################################################################################################################
+# STEP 3. BUILD THE TVB-NETPYNE INTERFACE
+# Build a TVB-NetPyNE interface with all the appropriate connections between the
+# TVB and NetPyNE modelled regions
+########################################################################################################################
+tvb_netpyne_interface_builder = TVBNetpyneInterfaceBuilder()
+tvb_netpyne_interface_builder.config = config
+tvb_netpyne_interface_builder.tvb_cosimulator = simulator
+tvb_netpyne_interface_builder.spiking_network = netpyne_network
+tvb_netpyne_interface_builder.model = INTERFACE_MODEL
+
+tvb_netpyne_interface_builder.input_flag = True   # If True, NetPyNE->TVB update will be implemented
+tvb_netpyne_interface_builder.output_flag = True  # If True, TVB->NetPyNE coupling will be implemented
+
+tvb_netpyne_interface_builder.default_coupling_mode = INTERFACE_COUPLING_MODE
+
+# Number of neurons in excitatory and inhibitory populations
+tvb_netpyne_interface_builder.N_E = int(netpyne_model_builder.population_order * scale_e)
+tvb_netpyne_interface_builder.N_I = int(netpyne_model_builder.population_order * scale_i)
+
+tvb_netpyne_interface_builder.proxy_inds = NODES_INDS
+
+#tvb_netpyne_interface_builder.exclusive_nodes = True
+# default is True
+
+tvb_netpyne_interface_builder.synaptic_weight_scale_func = synaptic_weight_scale_func
+
+proxy_inds = NODES_INDS
+
+tvb_netpyne_interface_builder.output_interfaces = [{
+    'voi': np.array(["R_e"]),         # TVB state variable to get data from
+    'populations': np.array(["E"]), # NetPyNE populations to couple to
+    # --------------- Arguments that can default if not given by the user:------------------------------
+    'model': tvb_netpyne_interface_builder.model, # This can be used to set default tranformer and proxy models
+    'transformer_params': {'scale_factor': np.array([1.0])}, # due to the way Netpyne generates spikes, no scaling by population size is needed
+    'proxy_params': {'number_of_neurons': tvb_netpyne_interface_builder.N_E},
+    'receptor_type': exc_syn,
+}]
+
+tvb_netpyne_interface_builder.input_interfaces = []
+for sVars, pop in zip([("S_e", "R_e"), ("S_i", "R_i")], ["E", "I"]):
+    tvb_netpyne_interface_builder.input_interfaces.append(
+        {'voi': sVars,
+        'populations': np.array([pop]),
+        'proxy_inds': NODES_INDS,
+        # --------------- Arguments that can default if not given by the user:------------------------------
+        # Set the enum entry or the corresponding label name for the "proxy_model",
+        # options "SPIKES" (i.e., spikes per neuron), "SPIKES_MEAN", "SPIKES_TOTAL"
+        # (the last two are identical for the moment returning all populations spikes together)
+        'proxy_model': "SPIKES_MEAN",
+        }
+    )
+
+tau_re = np.array([1.0])
+tau_ri = np.array([1.0])
+from tvb_multiscale.core.interfaces.base.transformers.models.red_wong_wang import \
+    ElephantSpikesRateRedWongWangExc, ElephantSpikesRateRedWongWangInh
+for interface, model, N, tau_s, tau_r, gamma in \
+        zip(tvb_netpyne_interface_builder.input_interfaces,
+            [ElephantSpikesRateRedWongWangExc, ElephantSpikesRateRedWongWangInh],
+            [tvb_netpyne_interface_builder.N_E, tvb_netpyne_interface_builder.N_I],
+            [simulator.model.tau_e, simulator.model.tau_i], [tau_re, tau_ri], [simulator.model.gamma_e, simulator.model.gamma_i]):
+    interface["transformer_model"] = model
+    interface["transformer_params"] = \
+        {"scale_factor": np.array([1.0]) / N,
+            "state": np.zeros((2, len(tvb_netpyne_interface_builder.proxy_inds))),
+            "tau_s": tau_s, "tau_r": tau_r, "gamma": gamma}
+
+# Configure and build:
+tvb_netpyne_interface_builder.configure()
+tvb_netpyne_interface_builder.print_summary_info_details(recursive=1)
+
+# This is how the user defined TVB -> Spiking Network interface looks after configuration
+print("\noutput (TVB->NetPyNE coupling) interfaces' configurations:\n")
+print(tvb_netpyne_interface_builder.output_interfaces)
+
+# This is how the user defined Spiking Network -> TVB interfaces look after configuration
+print("\ninput (NetPyNE->TVB update) interfaces' configurations:\n")
+print(tvb_netpyne_interface_builder.input_interfaces)
+
+from tvb_multiscale.core.interfaces.base.transformers.models.models import Transformers
+from tvb_multiscale.core.interfaces.base.transformers.builders import \
+    DefaultTVBtoSpikeNetTransformers, DefaultSpikeNetToTVBTransformers, \
+    DefaultTVBtoSpikeNetModels, DefaultSpikeNetToTVBModels
+from tvb_multiscale.tvb_nest.interfaces.builders import \
+    TVBtoNESTModels, NESTInputProxyModels, DefaultTVBtoNESTModels, \
+    NESTtoTVBModels, NESTOutputProxyModels, DefaultNESTtoTVBModels
